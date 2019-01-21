@@ -304,7 +304,8 @@ zero(_) ->
 % msg_ids are scoped per consumer
 % ra_indexes holds all raft indexes for enqueues currently on queue
 -spec apply(ra_machine:command_meta_data(), command(), state()) ->
-    {state(), ra_machine:effects(), Reply :: term()}.
+    {state(), Reply :: term(), ra_machine:effects()} |
+    {state(), Reply :: term()}.
 apply(Metadata, #enqueue{pid = From, seq = Seq,
                          msg = RawMsg}, State00) ->
     apply_enqueue(Metadata, From, Seq, RawMsg, State00);
@@ -700,7 +701,7 @@ query_messages_checked_out(#state{consumers = Consumers}) ->
               end, #{}, Consumers).
 
 query_messages_total(#state{ra_indexes = Indexes}) ->
-    rabbit_fifo_index:all(Indexes).
+    rabbit_fifo_index:to_map(Indexes).
 
 query_processes(#state{enqueuers = Enqs, consumers = Cons0}) ->
     Cons = maps:fold(fun({_, P}, V, S) -> S#{P => V} end, #{}, Cons0),
@@ -896,18 +897,19 @@ apply_enqueue(#{index := RaftIdx}, From, Seq, RawMsg, State0) ->
             {State, ok, Effects}
     end.
 
-drop_head(RaftIdx, #state{ra_indexes = Indexes0} = State) ->
-    %% Delete bytes
-    case take_next_msg(State) of
-        {ConsumerMsg = {_, {RaftIdxToDrop, _}}, State0, Messages} ->
-            Indexes = lists:foldl(fun rabbit_fifo_index:delete/2, Indexes0, [RaftIdxToDrop]),
-            update_smallest_raft_index(
-              RaftIdx, Indexes,
-              State0#state{messages = Messages,
-                           ra_indexes = Indexes},
-              dead_letter_effects(maps:put(none, ConsumerMsg, #{}), State0, []));
+drop_head(RaftIdx, #state{ra_indexes = Indexes0} = State0) ->
+    case take_next_msg(State0) of
+        {ConsumerMsg = {_MsgId, {RaftIdxToDrop, {_Header, Msg}}},
+         State1, Messages} ->
+            Indexes = rabbit_fifo_index:delete(RaftIdxToDrop, Indexes0),
+            Bytes = message_size(Msg),
+            State = add_bytes_drop(Bytes, State1#state{messages = Messages,
+                                                       ra_indexes = Indexes}),
+            Effects = dead_letter_effects(maps:put(none, ConsumerMsg, #{}),
+                                          State, []),
+            update_smallest_raft_index(RaftIdx, Indexes0, State, Effects);
         error ->
-            {State, ok, []}
+            {State0, ok, []}
     end.
 
 enqueue(RaftIdx, RawMsg, #state{messages = Messages,
@@ -1048,7 +1050,7 @@ dead_letter_effects(_Discarded,
     Effects;
 dead_letter_effects(Discarded,
                     #state{dead_letter_handler = {Mod, Fun, Args}}, Effects) ->
-    DeadLetters = maps:fold(fun(_, {_, {_, {_, Msg}}},
+    DeadLetters = maps:fold(fun(_, {_, {_, {_Header, Msg}}},
                                 % MsgId, MsgIdID, RaftId, Header
                                 Acc) -> [{rejected, Msg} | Acc]
                             end, [], Discarded),
@@ -1413,6 +1415,9 @@ make_update_config(Config) ->
 
 add_bytes_enqueue(Bytes, #state{msg_bytes_enqueue = Enqueue} = State) ->
     State#state{msg_bytes_enqueue = Enqueue + Bytes}.
+
+add_bytes_drop(Bytes, #state{msg_bytes_enqueue = Enqueue} = State) ->
+    State#state{msg_bytes_enqueue = Enqueue - Bytes}.
 
 add_bytes_checkout(Msg, #state{msg_bytes_checkout = Checkout,
                                msg_bytes_enqueue = Enqueue } = State) ->

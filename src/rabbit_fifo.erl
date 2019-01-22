@@ -309,43 +309,43 @@ zero(_) ->
 apply(Metadata, #enqueue{pid = From, seq = Seq,
                          msg = RawMsg}, State00) ->
     apply_enqueue(Metadata, From, Seq, RawMsg, State00);
-apply(#{index := RaftIdx},
+apply(Meta,
       #settle{msg_ids = MsgIds, consumer_id = ConsumerId},
       #state{consumers = Cons0} = State) ->
     case Cons0 of
         #{ConsumerId := Con0} ->
             % need to increment metrics before completing as any snapshot
             % states taken need to includ them
-            complete_and_checkout(RaftIdx, MsgIds, ConsumerId,
+            complete_and_checkout(Meta, MsgIds, ConsumerId,
                                   Con0, [], State);
         _ ->
             {State, ok}
 
     end;
-apply(#{index := RaftIdx}, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
+apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
       #state{consumers = Cons0} = State0) ->
     case Cons0 of
         #{ConsumerId := Con0} ->
             Discarded = maps:with(MsgIds, Con0#consumer.checked_out),
             Effects = dead_letter_effects(Discarded, State0, []),
-            complete_and_checkout(RaftIdx, MsgIds, ConsumerId, Con0,
+            complete_and_checkout(Meta, MsgIds, ConsumerId, Con0,
                                   Effects, State0);
         _ ->
             {State0, ok}
     end;
-apply(_, #return{msg_ids = MsgIds, consumer_id = ConsumerId},
+apply(Meta, #return{msg_ids = MsgIds, consumer_id = ConsumerId},
       #state{consumers = Cons0} = State) ->
     case Cons0 of
         #{ConsumerId := Con0 = #consumer{checked_out = Checked0}} ->
             Checked = maps:without(MsgIds, Checked0),
             Returned = maps:with(MsgIds, Checked0),
             MsgNumMsgs = maps:values(Returned),
-            return(ConsumerId, MsgNumMsgs, Con0, Checked, [], State);
+            return(Meta, ConsumerId, MsgNumMsgs, Con0, Checked, [], State);
         _ ->
             {State, ok}
     end;
-apply(_, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
-                 drain = Drain, consumer_id = ConsumerId},
+apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
+                    drain = Drain, consumer_id = ConsumerId},
       #state{consumers = Cons0,
              service_queue = ServiceQueue0} = State0) ->
     case Cons0 of
@@ -358,7 +358,7 @@ apply(_, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
                                                 ServiceQueue0),
             Cons = maps:put(ConsumerId, Con1, Cons0),
             {State1, ok, Effects} =
-                checkout(State0#state{service_queue = ServiceQueue,
+                checkout(Meta, State0#state{service_queue = ServiceQueue,
                                       consumers = Cons}, []),
             Response = {send_credit_reply, maps:size(State1#state.messages)},
             %% by this point all checkouts for the updated credit value
@@ -418,16 +418,16 @@ apply(_, #checkout{spec = {dequeue, unsettled},
         S ->
             {S, {dequeue, empty}}
     end;
-apply(_, #checkout{spec = cancel, consumer_id = ConsumerId}, State0) ->
+apply(Meta, #checkout{spec = cancel, consumer_id = ConsumerId}, State0) ->
     {State, Effects} = cancel_consumer(ConsumerId, State0, []),
     % TODO: here we should really demonitor the pid but _only_ if it has no
     % other consumers or enqueuers.
-    checkout(State, Effects);
-apply(_, #checkout{spec = Spec, meta = Meta,
-                   consumer_id = {_, Pid} = ConsumerId},
+    checkout(Meta, State, Effects);
+apply(Meta, #checkout{spec = Spec, meta = ConsumerMeta,
+                      consumer_id = {_, Pid} = ConsumerId},
       State0) ->
-    State1 = update_consumer(ConsumerId, Meta, Spec, State0),
-    checkout(State1, [{monitor, process, Pid}]);
+    State1 = update_consumer(ConsumerId, ConsumerMeta, Spec, State0),
+    checkout(Meta, State1, [{monitor, process, Pid}]);
 apply(#{index := RaftIdx}, #purge{},
       #state{ra_indexes = Indexes0,
              messages = Messages} = State0) ->
@@ -485,7 +485,7 @@ apply(_, {down, ConsumerPid, noconnection},
     %% TODO: should we run a checkout here?
     {State#state{consumers = Cons, enqueuers = Enqs,
                  waiting_consumers = WaitingConsumers}, ok, Effects};
-apply(_, {down, Pid, _Info}, #state{consumers = Cons0,
+apply(Meta, {down, Pid, _Info}, #state{consumers = Cons0,
                                     enqueuers = Enqs0} = State0) ->
     % Remove any enqueuer for the same pid and enqueue any pending messages
     % This should be ok as we won't see any more enqueues from this pid
@@ -505,8 +505,8 @@ apply(_, {down, Pid, _Info}, #state{consumers = Cons0,
     {State, Effects} = lists:foldl(fun(ConsumerId, {S, E}) ->
                                            cancel_consumer(ConsumerId, S, E)
                                    end, {State2, Effects1}, DownConsumers),
-    checkout(State, Effects);
-apply(_, {nodeup, Node}, #state{consumers = Cons0,
+    checkout(Meta, State, Effects);
+apply(Meta, {nodeup, Node}, #state{consumers = Cons0,
                                 enqueuers = Enqs0,
                                 service_queue = SQ0} = State0) ->
     %% A node we are monitoring has come back.
@@ -534,9 +534,9 @@ apply(_, {nodeup, Node}, #state{consumers = Cons0,
                           Acc
                   end, {Cons0, SQ0, Monitors}, Cons0),
     % TODO: avoid list concat
-    checkout(State0#state{consumers = Cons1, enqueuers = Enqs1,
-                          service_queue = SQ,
-                          waiting_consumers = WaitingConsumers}, Effects);
+    checkout(Meta, State0#state{consumers = Cons1, enqueuers = Enqs1,
+                                service_queue = SQ,
+                                waiting_consumers = WaitingConsumers}, Effects);
 apply(_, {nodedown, _Node}, State) ->
     {State, ok};
 apply(_, #update_config{config = Conf}, State) ->
@@ -883,33 +883,48 @@ cancel_consumer0(ConsumerId,
 
 apply_enqueue(#{index := RaftIdx}, From, Seq, RawMsg, State0) ->
     Bytes = message_size(RawMsg),
-    WillOverflow = will_overflow(Bytes, State0),
-    {State1, ok, Effects1} = case WillOverflow of
-                                 true -> drop_head(RaftIdx, State0);
-                                 false -> {State0, ok, []}
-                             end,
-    case maybe_enqueue(RaftIdx, From, Seq, RawMsg, Effects1, State1) of
-        {ok, State2, Effects2} ->
-            {State, ok, Effects} = checkout(add_bytes_enqueue(Bytes, State2),
-                                            Effects2),
-            append_to_master_index(RaftIdx, Effects, State);
+    case maybe_enqueue(RaftIdx, From, Seq, RawMsg, [], State0) of
+        {ok, State1, Effects1} ->
+            %% avoid evaluating limit here
+            {State2, _Result, Effects2} = checkout0(
+                                            checkout_one(
+                                              add_bytes_enqueue(Bytes, State1)),
+                                            Effects1, #{}),
+            {State3, Result, Effects3} = evaluate_limit(State0#state.ra_indexes,
+                                                        false,
+                                                        State2, Effects2),
+
+            {State, _, Effects} = append_to_master_index(RaftIdx, Effects3,
+                                                         State3),
+            case Result of
+                true ->
+                    update_smallest_raft_index(RaftIdx, State0#state.ra_indexes,
+                                               State, Effects);
+                false ->
+                    {State, ok, Effects}
+            end;
         {duplicate, State, Effects} ->
             {State, ok, Effects}
     end.
 
-drop_head(RaftIdx, #state{ra_indexes = Indexes0} = State0) ->
+drop_head(#state{ra_indexes = Indexes0} = State0, Effects0) ->
     case take_next_msg(State0) of
-        {ConsumerMsg = {_MsgId, {RaftIdxToDrop, {_Header, Msg}}},
+        {FullMsg = {_MsgId, {RaftIdxToDrop, {_Header, Msg}}},
          State1, Messages} ->
+            % ct:pal("drop_head dropping ~p~n", [RaftIdxToDrop]),
             Indexes = rabbit_fifo_index:delete(RaftIdxToDrop, Indexes0),
             Bytes = message_size(Msg),
             State = add_bytes_drop(Bytes, State1#state{messages = Messages,
                                                        ra_indexes = Indexes}),
-            Effects = dead_letter_effects(maps:put(none, ConsumerMsg, #{}),
-                                          State, []),
-            update_smallest_raft_index(RaftIdx, Indexes0, State, Effects);
-        error ->
-            {State0, ok, []}
+            Effects = dead_letter_effects(maps:put(none, FullMsg, #{}),
+                                          State, Effects0),
+            {State, Effects};
+        {'$prefix_msg', State, Messages} ->
+            % ct:pal("drop_head prefix_msg ~p~n", [State]),
+            {State#state{messages = Messages}, Effects0};
+        empty ->
+            % error_logger:info_msg("unexpected ~p~n", [State0]),
+            {State0, Effects0}
     end.
 
 enqueue(RaftIdx, RawMsg, #state{messages = Messages,
@@ -981,7 +996,7 @@ maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
 snd(T) ->
     element(2, T).
 
-return(ConsumerId, MsgNumMsgs, Con0, Checked,
+return(Meta, ConsumerId, MsgNumMsgs, Con0, Checked,
        Effects0, #state{consumers = Cons0, service_queue = SQ0} = State0) ->
     Con = Con0#consumer{checked_out = Checked,
                         credit = increase_credit(Con0, length(MsgNumMsgs))},
@@ -992,8 +1007,8 @@ return(ConsumerId, MsgNumMsgs, Con0, Checked,
                             ({MsgNum, Msg}, S0) ->
                                  return_one(MsgNum, Msg, S0)
                          end, State0, MsgNumMsgs),
-    checkout(State1#state{consumers = Cons,
-                          service_queue = SQ},
+    checkout(Meta, State1#state{consumers = Cons,
+                                service_queue = SQ},
              Effects).
 
 % used to processes messages that are finished
@@ -1024,7 +1039,7 @@ increase_credit(#consumer{lifetime = auto,
 increase_credit(#consumer{credit = Current}, Credit) ->
     Current + Credit.
 
-complete_and_checkout(IncomingRaftIdx, MsgIds, ConsumerId,
+complete_and_checkout(#{index := IncomingRaftIdx} = Meta, MsgIds, ConsumerId,
                       #consumer{checked_out = Checked0} = Con0,
                       Effects0, #state{ra_indexes = Indexes0} = State0) ->
     Checked = maps:without(MsgIds, Checked0),
@@ -1040,7 +1055,7 @@ complete_and_checkout(IncomingRaftIdx, MsgIds, ConsumerId,
     {State2, Effects1} = complete(ConsumerId, MsgRaftIdxs,
                                   maps:size(Discarded),
                                   Con0, Checked, Effects0, State1),
-    {State, ok, Effects} = checkout(State2, Effects1),
+    {State, ok, Effects} = checkout(Meta, State2, Effects1),
     % settle metrics are incremented separately
     update_smallest_raft_index(IncomingRaftIdx, Indexes0, State, Effects).
 
@@ -1062,13 +1077,13 @@ cancel_consumer_effects(ConsumerId, #state{queue_resource = QName}, Effects) ->
 
 update_smallest_raft_index(IncomingRaftIdx, OldIndexes,
                            #state{ra_indexes = Indexes,
-                                  % prefix_msg_count = 0,
                                   messages = Messages} = State, Effects) ->
     case rabbit_fifo_index:size(Indexes) of
         0 when map_size(Messages) =:= 0 ->
             % there are no messages on queue anymore and no pending enqueues
             % we can forward release_cursor all the way until
             % the last received command
+            % ct:pal("0 really? ~w ~n~p", [IncomingRaftIdx, State]),
             {State, ok, [{release_cursor, IncomingRaftIdx, State} | Effects]};
         _ ->
             NewSmallest = rabbit_fifo_index:smallest(Indexes),
@@ -1106,7 +1121,7 @@ return_one(MsgNum, {RaftId, {Header0, RawMsg}},
                      State0#state{messages = maps:put(MsgNum, Msg, Messages),
                                   returns = lqueue:in(MsgNum, Returns)}).
 
-return_all(State, Checked0) ->
+return_all(State0, Checked0) ->
     %% need to sort the list so that we return messages in the order
     %% they were checked out
     Checked = lists:sort(maps:to_list(Checked0)),
@@ -1114,12 +1129,23 @@ return_all(State, Checked0) ->
                         return_one(0, '$prefix_msg', S);
                     ({_, {MsgNum, Msg}}, S) ->
                         return_one(MsgNum, Msg, S)
-                end, State, Checked).
+                end, State0, Checked).
+
+
 
 %% checkout new messages to consumers
 %% reverses the effects list
-checkout(State, Effects) ->
-    checkout0(checkout_one(State), Effects, #{}).
+checkout(#{index := Index}, State0, Effects0) ->
+    {State1, _Result, Effects1} = checkout0(checkout_one(State0),
+                                         Effects0, #{}),
+    case evaluate_limit(State0#state.ra_indexes, false,
+                        State1, Effects1) of
+        {State, true, Effects} ->
+            update_smallest_raft_index(Index, State0#state.ra_indexes,
+                                       State, Effects);
+        {State, false, Effects} ->
+            {State, ok, Effects}
+    end.
 
 checkout0({success, ConsumerId, MsgId, Msg, State}, Effects, Acc0) ->
     DelMsg = {MsgId, Msg},
@@ -1127,12 +1153,25 @@ checkout0({success, ConsumerId, MsgId, Msg, State}, Effects, Acc0) ->
                            fun (M) -> [DelMsg | M] end,
                            [DelMsg], Acc0),
     checkout0(checkout_one(State), Effects, Acc);
-checkout0({inactive, State}, Effects0, Acc) ->
-    Effects = append_send_msg_effects(Effects0, Acc),
-    {State, ok, lists:reverse([{aux, inactive} | Effects])};
-checkout0(State, Effects0, Acc) ->
-    Effects = append_send_msg_effects(Effects0, Acc),
-    {State, ok, lists:reverse(Effects)}.
+checkout0({inactive, State0}, Effects0, Acc) ->
+    Effects1 = [{aux, inactive} | append_send_msg_effects(Effects0, Acc)],
+    {State0, ok, lists:reverse(Effects1)}.
+
+evaluate_limit(_OldIndexes, Result,
+               #state{max_length = undefined,
+                      max_bytes = undefined} = State,
+               Effects) ->
+    {State, Result, Effects};
+evaluate_limit(OldIndexes, Result,
+               State0, Effects0) ->
+    case is_over_limit(State0) of
+        true ->
+            {State, Effects} = drop_head(State0, Effects0),
+            evaluate_limit(OldIndexes, true, State, Effects);
+        false ->
+            {State0, Result, Effects0}
+            %% TODO: optimisation: avoid calling if nothing has been dropped?
+    end.
 
 append_send_msg_effects(Effects, AccMap) when map_size(AccMap) == 0 ->
     Effects;
@@ -1169,6 +1208,7 @@ next_checkout_message(#state{returns = Returns,
                     end
             end;
         empty ->
+            % ct:pal("next_checkout_msg prefix ~w", [P]),
             %% There are prefix msgs
             {'$prefix_msg', State#state{prefix_msg_counts = {R, P - 1}}}
     end.
@@ -1191,7 +1231,7 @@ take_next_msg(#state{messages = Messages0} = State0) ->
                 {IdxMsg, Messages} ->
                     {{NextMsgInId, IdxMsg}, State, Messages};
                 error ->
-                    error
+                    empty
             end
     end.
 
@@ -1243,12 +1283,12 @@ checkout_one(#state{service_queue = SQ0,
                             %% consumer did not exist but was queued, recurse
                             checkout_one(InitState#state{service_queue = SQ1})
                     end;
-                error ->
-                    InitState
+                empty ->
+                    {inactive, InitState}
             end;
         empty ->
             case maps:size(Messages0) of
-                0 -> InitState;
+                0 -> {inactive, InitState};
                 _ -> {inactive, InitState}
             end
     end.
@@ -1322,8 +1362,7 @@ update_consumer0(ConsumerId, Meta, {Life, Credit, Mode},
                                 %% the credit update
                                 N = maps:size(S#consumer.checked_out),
                                 C = max(0, Credit - N),
-                                S#consumer{lifetime = Life,
-                                    credit = C}
+                                S#consumer{lifetime = Life, credit = C}
                             end, Init, Cons0),
     ServiceQueue = maybe_queue_consumer(ConsumerId, maps:get(ConsumerId, Cons),
         ServiceQueue0),
@@ -1361,21 +1400,35 @@ dehydrate_state(#state{messages = Messages,
                                      end, Consumers),
                 returns = lqueue:new(),
                 %% messages include returns
-                prefix_msg_counts = {RetLen + PrefRetCnt,
-                                     PrefixMsgCnt}}.
+                prefix_msg_counts = {RetLen + PrefRetCnt, PrefixMsgCnt},
+                msg_bytes_enqueue = 0,
+                msg_bytes_checkout = 0}.
 
 dehydrate_consumer(#consumer{checked_out = Checked0} = Con) ->
     Checked = maps:map(fun (_, _) -> '$prefix_msg' end, Checked0),
     Con#consumer{checked_out = Checked}.
 
-will_overflow(_Bytes, #state{max_length = undefined,
-                                    max_bytes = undefined}) ->
+is_over_limit(#state{max_length = undefined,
+                     max_bytes = undefined}) ->
     false;
-will_overflow(Bytes, #state{max_length = MaxLength, ra_indexes = Indexes,
-                            max_bytes = MaxBytes, msg_bytes_enqueue = BytesEnq} = State) ->
-    ExpectedSize = Bytes + BytesEnq,
-    ((rabbit_fifo_index:size(Indexes) - num_checked_out(State)) >= MaxLength)
-        orelse (ExpectedSize > MaxBytes).
+is_over_limit(#state{max_length = MaxLength,
+                     messages = Messages,
+                     returns = Returns,
+                     max_bytes = _MaxBytes,
+                     % consumers = Cons,
+                     prefix_msg_counts = {Rtn, Pref},
+                     msg_bytes_enqueue = _BytesEnq}) ->
+
+    %% TODO: this is rubbish - optimise
+    % NumChecked = maps:fold(fun (_, #consumer{checked_out = C0}, Acc) ->
+    %                                C = maps:filter(
+    %                                      fun(_, '$prefix_msg') -> false;
+    %                                         (_, _) -> true
+    %                                      end, C0),
+    %                                maps:size(C) + Acc
+    %                        end, 0, Cons),
+    % ((rabbit_fifo_index:size(Indexes) + Rtn + Pref - num_checked_out(State))
+    ((lqueue:len(Returns) + maps:size(Messages) + Rtn + Pref) > MaxLength). %% orelse (BytesEnq > MaxBytes).
 
 -spec make_enqueue(maybe(pid()), maybe(msg_seqno()), raw_msg()) -> protocol().
 make_enqueue(Pid, Seq, Msg) ->
